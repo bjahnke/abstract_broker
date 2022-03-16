@@ -3,7 +3,7 @@ from setuptools import setup
 setup(
     name='abstract_broker',
     version='0.0.1',
-    packages=['abstract'],
+    packages=['abstract_broker'],
     url='',
     license='',
     author='bjahnke',
