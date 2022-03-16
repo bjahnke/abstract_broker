@@ -159,12 +159,29 @@ class AbstractBrokerAccount(ABC):
     def get_symbols(self) -> t.List[str]:
         """get all symbols of active positions within this account"""
         raise NotImplementedError
+    
+    
+class ClientAlreadyExistsError(Exception):
+    """
+    a broker client of this type has already been initialized,
+    cannot create another.
+    """
 
 
 class AbstractBrokerClient(ABC):
+    __instance_exists = False
     """top level api client"""
-    def __init__(self, *args, **kwargs):
-        pass
+    def __init__(self, credentials, *args, **kwargs):
+        if self.__class__.__instance_exists is True:
+            raise ClientAlreadyExistsError
+        else:
+            self.__class__.__instance_exists = True
+            
+        self._client = self._get_broker_client(credentials)
+    
+    @abstractmethod
+    def _get_broker_client(self, credentials) -> t.Any:
+        raise NotImplementedError
 
     @abstractmethod
     def account_info(self, *args, **kwargs) -> t.Type[AbstractBrokerAccount]:
@@ -179,11 +196,7 @@ class AbstractBrokerClient(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def cancel_order(self, order_id):
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_order_data(self):
+    def get_order_data(self, order_id, *args):
         raise NotImplementedError
 
     @abstractmethod
