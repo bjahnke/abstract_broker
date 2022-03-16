@@ -177,10 +177,11 @@ class AbstractBrokerClient(ABC):
         else:
             self.__class__.__instance_exists = True
             
-        self._client = self._get_broker_client(credentials)
-    
+        self._client = self.__class__._get_broker_client(credentials)
+
+    @staticmethod
     @abstractmethod
-    def _get_broker_client(self, credentials) -> t.Any:
+    def _get_broker_client(credentials) -> t.Any:
         raise NotImplementedError
 
     @abstractmethod
@@ -413,7 +414,6 @@ class AbstractTickerStream:
         fetch_price_data: DATA_FETCH_FUNCTION,
         interval: int = 1,
     ):
-        # self._stream = stream
         self._stream_parser_cls = stream_parser
         self._quote_file_path = quote_file_path
         self._history_path = history_path
@@ -447,18 +447,18 @@ class AbstractTickerStream:
 
         return send_conn
 
-    def handle_stream(
-        self, current_quotes, queue: mp.SimpleQueue, send_conn: Connection
-    ):
-        """handles the messages, translates to ohlc values, outputs to json and csv"""
-        # start_time = time()
-        while True:
-            msg = queue.get()
-            symbol = self.__class__.get_symbol(msg)
-            self._stream_parsers[symbol].update_ohlc_state(msg)
-            ohlc_data = self._stream_parsers[symbol].get_ohlc()
-            current_quotes[symbol] = ohlc_data
-            send_conn.send(current_quotes)
+    # def handle_stream(
+    #     self, current_quotes, queue: mp.SimpleQueue, send_conn: Connection
+    # ):
+    #     """handles the messages, translates to ohlc values, outputs to json and csv"""
+    #     # start_time = time()
+    #     while True:
+    #         msg = queue.get()
+    #         symbol = self.__class__.get_symbol(msg)
+    #         self._stream_parsers[symbol].update_ohlc_state(msg)
+    #         ohlc_data = self._stream_parsers[symbol].get_ohlc()
+    #         current_quotes[symbol] = ohlc_data
+    #         send_conn.send(current_quotes)
 
     def _write_row_handler(self, receive_conn: Connection):
         """
