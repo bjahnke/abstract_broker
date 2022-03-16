@@ -140,6 +140,7 @@ class AbstractPosition(ABC):
 
 
 class AbstractBrokerAccount(ABC):
+    """get account info"""
     def __init__(self, *args, **kwargs):
         pass
 
@@ -161,6 +162,7 @@ class AbstractBrokerAccount(ABC):
 
 
 class AbstractBrokerClient(ABC):
+    """top level api client"""
     def __init__(self, *args, **kwargs):
         pass
 
