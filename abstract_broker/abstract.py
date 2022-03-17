@@ -43,8 +43,13 @@ class Side(Enum):
 def set_bar_end_time(interval, time_stamp):
     time_remaining = interval - time_stamp.minute % interval
     # print(time_stamp.minute + time_remaining)
+    minute_bound = time_stamp.minute + time_remaining
+    hour_bound = time_stamp.hour
+    if minute_bound == 60:
+        minute_bound = 0
+        hour_bound += 1
     right_bound_time = time_stamp.replace(
-        minute=time_stamp.minute + time_remaining, second=0, microsecond=0
+        hour=hour_bound, minute=minute_bound, second=0, microsecond=0
     )
     return right_bound_time
 
@@ -203,6 +208,14 @@ class AbstractBrokerClient(ABC):
     @abstractmethod
     def init_position(self, symbol, quantity, side):
         raise NotImplementedError
+    
+    @abstractmethod
+    def init_stream(self, *args, **kwargs):
+        raise NotImplementedError
+    
+    @property
+    def client(self):
+        return self._client
 
 
 class AbstractOrders(ABC):
@@ -229,7 +242,7 @@ class ReSize(Enum):
 
 
 OHLC_VALUES = t.Tuple[float, float, float, float]
-DATA_FETCH_FUNCTION = t.Callable[[str, int, int, str], t.Tuple[pd.DataFrame, t.Any]]
+DATA_FETCH_FUNCTION = t.Callable[[str, int], t.Tuple[pd.DataFrame, t.Any]]
 
 
 class CsvPermissionError(Exception):
@@ -305,10 +318,12 @@ class AbstractStreamParser(ABC):
         symbol,
         fetch_price_data: DATA_FETCH_FUNCTION,
         data_delay,
+        fetch_price_params: t.Dict[str, t.Any],
         live_quote_file_path=None,
         history_path="",
         interval: int = 1,
     ):
+        self._fetch_price_params = fetch_price_params
         self._data_delay = data_delay
         self._stream_state = StreamState.INITIAL
         self._stream_init_time = None
@@ -341,8 +356,8 @@ class AbstractStreamParser(ABC):
 
     def fetch_price_data(self) -> t.Tuple[pd.DataFrame, t.Any]:
         """x days worth of minute data by the given interval"""
-        x = 5
-        return self._fetch_price_data(self._symbol, self._interval, x, "m")
+        # x = 5
+        return self._fetch_price_data(**self._fetch_price_params)
 
     def update_ohlc_state(self, data: t.Dict):
         """"""
@@ -365,7 +380,9 @@ class AbstractStreamParser(ABC):
         next_bar_time = self._stream_init_time.replace(
             second=0, microsecond=0
         ) + timedelta(minutes=self._stream_init_time.minute % self._interval)
-        self._target_fetch_time = next_bar_time + self._data_delay
+        self._target_fetch_time = next_bar_time
+        if self._data_delay is not None:
+            self._target_fetch_time += self._data_delay
         return StreamState.FILL_GAP
 
     def _allow_fill_data_gap(self, time_stamp) -> StreamState:
@@ -375,7 +392,7 @@ class AbstractStreamParser(ABC):
         """
         next_state = StreamState.FILL_GAP
         if time_stamp > self._target_fetch_time:
-            price_data, _ = self.fetch_price_data()
+            price_data = self.fetch_price_data()
             price_data.to_csv(self._history_file_path)
             print(f"{self._symbol} gap filled")
             next_state = StreamState.NORMAL_UPDATE
@@ -414,6 +431,18 @@ class AbstractTickerStream:
         fetch_price_data: DATA_FETCH_FUNCTION,
         interval: int = 1,
     ):
+        """
+        NOTE: fetch_price_data CANNOT be pickled if it is an instance attribute
+        :param stream_parser: 
+        :param quote_file_path: path to live quote file, SHOULD NOT INCLUDE FILE NAME
+        :param history_path: path to output history file, SHOULD NOT INCLUDE FILE NAME
+        :param fetch_price_data: 
+        :param interval: 
+        """
+        # self.__class__._validate_path(
+        #     (quote_file_path, '.json'),
+        #     (history_path, '.csv')
+        # )
         self._stream_parser_cls = stream_parser
         self._quote_file_path = quote_file_path
         self._history_path = history_path
@@ -425,6 +454,12 @@ class AbstractTickerStream:
         self._msg_queue_lookup = {}
 
         self._columns = ["symbol", "open", "high", "low", "close"]
+
+    @staticmethod
+    def _validate_path(*path_check: t.Tuple[str, str]):
+        """ensures each file path contains the expected file extension"""
+        for file_path, file_type_check in path_check:
+            assert file_type_check in file_path[-len(file_type_check):]
 
     @abstractmethod
     def run_stream(self, *args, **kwargs):
@@ -442,7 +477,16 @@ class AbstractTickerStream:
         :return:
         """
         receive_conn, send_conn = mp.Pipe(duplex=False)
-        write_process = mp.Process(target=self._write_row_handler, args=(receive_conn,))
+        write_process = mp.Process(
+            target=_write_row_handler,
+            args=(
+                self._interval,
+                self._columns,
+                price_history_fp,
+                self._history_path,
+                receive_conn,
+            )
+        )
         write_process.start()
 
         return send_conn
@@ -504,12 +548,22 @@ class AbstractTickerStream:
                 bar_end_time = set_bar_end_time(self._interval, time_stamp)
 
     def get_price_history_file_path(self, symbol: str):
+        """"""
         full_path = f"{symbol}.csv"
         if len(self._history_path) > 0:
             full_path = f"{self._history_path}\\{full_path}"
         return full_path
 
-    def _init_stream_parsers(self, symbol_delays: t.Tuple[str, t.Any]):
+
+
+    def _init_stream_parsers(self, *args: t.Tuple[str, t.Any, t.Dict]):
+        """
+        initialize stream parser for all symbols in stream, 
+        where additional delay relates to time delay of price history data to account for,
+        and a dict of params to be passed into the fetch price history function
+        :param args: 
+        :return: 
+        """
         self._stream_parsers = {
             symbol: (
                 self._stream_parser_cls(
@@ -518,7 +572,66 @@ class AbstractTickerStream:
                     interval=self._interval,
                     fetch_price_data=self._fetch_price_data,
                     history_path=self._history_path,
+                    fetch_price_params=fetch_params
                 )
             )
-            for symbol, delay in symbol_delays
+            for symbol, delay, fetch_params in args
         }
+
+
+def price_history_fp(history_path, symbol):
+    full_path = f"{symbol}.csv"
+    if len(history_path) > 0:
+        full_path = f"{history_path}\\{full_path}"
+    return full_path
+
+
+def _write_row_handler(
+        interval,
+        columns,
+        get_price_history_file_path,
+        history_path,
+        receive_conn: Connection):
+    """
+    NOTE: Pure function for compatability with multiprocess
+    wait until until the current bar time is exceeded, then write
+    the current content of the receive connection as a new row
+    :param receive_conn:
+    :return:
+    """
+
+    # TODO PRINT lag
+    bar_end_time = set_bar_end_time(interval, datetime.utcnow())
+    current_quotes = None
+
+    while True:
+        time_stamp = datetime.utcnow()
+        if receive_conn.poll():
+            current_quotes = receive_conn.recv()
+        if time_stamp > bar_end_time:
+            pre_write_lag = time_stamp - bar_end_time
+            if current_quotes is None:
+                # don't do anything until we receive the first message
+                continue
+
+            for symbol, price_data in current_quotes.items():
+                if price_data is not None:
+                    new_row = pd.DataFrame(
+                        [price_data.values()],
+                        columns=columns,
+                        index=[bar_end_time],
+                    )
+                    new_row.to_csv(
+                        get_price_history_file_path(history_path, symbol),
+                        mode="a",
+                        header=False,
+                    )
+                    post_write_lag = datetime.utcnow() - bar_end_time
+                    print(
+                        f"{symbol} {bar_end_time} "
+                        f"(pre-write lag): {pre_write_lag}, "
+                        f"(post-write lag): {post_write_lag}"
+                    )
+
+            # shift bar end time to the right by 1 interval
+            bar_end_time = set_bar_end_time(interval, time_stamp)
