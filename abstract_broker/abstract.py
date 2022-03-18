@@ -54,6 +54,25 @@ def set_bar_end_time(interval, time_stamp):
     return right_bound_time
 
 
+def get_target_fetch_time(stream_init_time, interval, data_delay=None):
+    """
+    given stream start time and interval of data,
+    get the time when price history should be retreived 
+    to ensure no data gaps
+    """
+    time_remainder = timedelta(minutes=stream_init_time.minute % interval)
+    if interval == 1:
+        time_remainder += timedelta(minutes=1)
+
+    target_fetch_time = stream_init_time.replace(
+        second=0, microsecond=0
+    ) + time_remainder
+
+    if data_delay is not None:
+        target_fetch_time += data_delay
+    return target_fetch_time
+
+
 # ----------------------
 # UTIL FUNCTIONS (END)
 # ----------------------
@@ -242,7 +261,7 @@ class ReSize(Enum):
 
 
 OHLC_VALUES = t.Tuple[float, float, float, float]
-DATA_FETCH_FUNCTION = t.Callable[[str, int], t.Tuple[pd.DataFrame, t.Any]]
+DATA_FETCH_FUNCTION = t.Callable[[str, int], pd.DataFrame]
 
 
 class CsvPermissionError(Exception):
@@ -253,8 +272,14 @@ class LiveQuotePermissionError(Exception):
     """PermissionError raised when attempting to read/write from price history csv"""
 
 
-class Bar:
-    def __init__(self, interval, time_stamp):
+class AbstractStreamParser(ABC):
+    """
+    class for defining how to parse stream data,
+    additionally includes a state machine for
+    """
+
+    def __init__(self, interval, time_stamp, symbol):
+        self._symbol = symbol
         self._interval = interval
         self._bar_end_time = set_bar_end_time(interval, time_stamp)
         self._open = None
@@ -279,12 +304,14 @@ class Bar:
     def get_ohlc_values(self) -> OHLC_VALUES:
         return self._open, self._high, self._low, self._close
 
-    def update_ohlc(self, values: OHLC_VALUES, time_stamp):
+    def update_ohlc(self, data: t.Dict, time_stamp) -> t.Dict[str, float]:
+        values = self.retrieve_ohlc(data)
         if time_stamp > self._bar_end_time:
             self._bar_end_time = set_bar_end_time(self._interval, time_stamp)
             self.init_new(*values)
         else:
             self.update(*values)
+        return self.get_ohlc()
 
     def get_ohlc(self):
         return {
@@ -292,126 +319,13 @@ class Bar:
             "high": self._high,
             "low": self._low,
             "close": self._close,
-        }
-
-
-class StreamState(Enum):
-    INITIAL = auto()
-    WAIT = auto()
-    FILL_GAP = auto()
-    NORMAL_UPDATE = auto()
-    INIT_NEW_BAR = auto()
-    ADD_NEW_BAR = auto()
-
-
-class AbstractStreamParser(ABC):
-    """
-    class for defining how to parse stream data,
-    additionally includes a state machine for
-    """
-    _quoted_prices: OHLC_VALUES
-    _fetch_price_data: DATA_FETCH_FUNCTION
-    _state_table: t.Dict[StreamState, t.Callable[[datetime.timestamp], StreamState]]
-
-    def __init__(
-        self,
-        symbol,
-        fetch_price_data: DATA_FETCH_FUNCTION,
-        data_delay,
-        fetch_price_params: t.Dict[str, t.Any],
-        live_quote_file_path=None,
-        history_path="",
-        interval: int = 1,
-    ):
-        self._fetch_price_params = fetch_price_params
-        self._data_delay = data_delay
-        self._stream_state = StreamState.INITIAL
-        self._stream_init_time = None
-        self._target_fetch_time = None
-        self._live_quote_file_path = live_quote_file_path
-        self._symbol = symbol
-        self._fetch_price_data = fetch_price_data
-        self._history_file_path = self.__class__._init_price_history_path(
-            history_path, symbol
-        )
-        self._interval = interval
-        self._bar_data = None
-        self._quoted_prices = (0, 0, 0, 0)
-        self._prev_sequence = None
-
-        self._state_table = {
-            StreamState.INITIAL: self._init_stream_data,
-            StreamState.FILL_GAP: self._allow_fill_data_gap,
-            StreamState.NORMAL_UPDATE: self._do_nothing,
+            "symbol": self._symbol
         }
 
     @abstractmethod
     def retrieve_ohlc(self, data: dict) -> OHLC_VALUES:
         """get prices from ticker stream"""
         raise NotImplementedError
-
-    @property
-    def history_file_path(self):
-        return
-
-    def fetch_price_data(self) -> t.Tuple[pd.DataFrame, t.Any]:
-        """x days worth of minute data by the given interval"""
-        # x = 5
-        return self._fetch_price_data(**self._fetch_price_params)
-
-    def update_ohlc_state(self, data: t.Dict):
-        """"""
-        self._quoted_prices = self.retrieve_ohlc(data)
-        time_stamp = datetime.utcnow()
-
-        self._stream_state = self._state_table[self._stream_state](time_stamp)
-
-        self._bar_data.update_ohlc(self._quoted_prices, time_stamp)
-
-    def _init_stream_data(self, time_stamp) -> StreamState:
-        """
-        make an initial price history call,
-        calculate the amount of time needed for the
-        stream to run to close the data gap between
-        price history end and stream start
-        """
-        self._stream_init_time = time_stamp
-        self._bar_data = Bar(self._interval, time_stamp)
-        next_bar_time = self._stream_init_time.replace(
-            second=0, microsecond=0
-        ) + timedelta(minutes=self._stream_init_time.minute % self._interval)
-        self._target_fetch_time = next_bar_time
-        if self._data_delay is not None:
-            self._target_fetch_time += self._data_delay
-        return StreamState.FILL_GAP
-
-    def _allow_fill_data_gap(self, time_stamp) -> StreamState:
-        """
-        wait for current time to exceed target time,
-        get price history again. Now there is no longer a data gap
-        """
-        next_state = StreamState.FILL_GAP
-        if time_stamp > self._target_fetch_time:
-            price_data = self.fetch_price_data()
-            price_data.to_csv(self._history_file_path)
-            print(f"{self._symbol} gap filled")
-            next_state = StreamState.NORMAL_UPDATE
-        return next_state
-
-    def _do_nothing(self, _):
-        return self._stream_state
-
-    def get_ohlc(self) -> t.Dict:
-        res = self._bar_data.get_ohlc()
-        res["symbol"] = self._symbol
-        return res
-
-    @staticmethod
-    def _init_price_history_path(price_history_path, symbol):
-        full_path = f"{symbol}.ftr"
-        if len(price_history_path) > 0:
-            full_path = f"{price_history_path}\\{full_path}"
-        return full_path
 
 
 class AbstractTickerStream:
@@ -448,11 +362,7 @@ class AbstractTickerStream:
         self._history_path = history_path
         self._interval = interval
         self._stream_parsers = {}
-        # self._live_data_out = {}
         self._fetch_price_data = fetch_price_data
-        # self._permission_error_count = 0
-        self._msg_queue_lookup = {}
-
         self._columns = ["symbol", "open", "high", "low", "close"]
 
     @staticmethod
@@ -465,12 +375,15 @@ class AbstractTickerStream:
     def run_stream(self, *args, **kwargs):
         raise NotImplementedError
 
+    def get_fetch_time(self, stream_start_time, data_delay):
+        return get_target_fetch_time(stream_start_time, self._interval, data_delay)
+        
     @staticmethod
     @abstractmethod
     def get_symbol(msg) -> str:
         raise NotImplementedError
 
-    def _init_processes(self):
+    def _init_processes(self, writer_send_conn):
         """
         Initialize a separate process for writing data to file
         :param:
@@ -482,9 +395,9 @@ class AbstractTickerStream:
             args=(
                 self._interval,
                 self._columns,
-                price_history_fp,
                 self._history_path,
                 receive_conn,
+                writer_send_conn,
             )
         )
         write_process.start()
@@ -504,59 +417,7 @@ class AbstractTickerStream:
     #         current_quotes[symbol] = ohlc_data
     #         send_conn.send(current_quotes)
 
-    def _write_row_handler(self, receive_conn: Connection):
-        """
-        wait until until the current bar time is exceeded, then write
-        the current content of the receive connection as a new row
-        :param receive_conn:
-        :return:
-        """
-        # TODO PRINT lag
-        bar_end_time = set_bar_end_time(self._interval, datetime.utcnow())
-        current_quotes = None
-
-        while True:
-            time_stamp = datetime.utcnow()
-            if receive_conn.poll():
-                current_quotes = receive_conn.recv()
-            if time_stamp > bar_end_time:
-                pre_write_lag = time_stamp - bar_end_time
-                if current_quotes is None:
-                    # don't do anything until we receive the first message
-                    continue
-
-                for symbol, price_data in current_quotes.items():
-                    if price_data is not None:
-                        new_row = pd.DataFrame(
-                            [price_data.values()],
-                            columns=self._columns,
-                            index=[bar_end_time],
-                        )
-                        new_row.to_csv(
-                            self.get_price_history_file_path(symbol),
-                            mode="a",
-                            header=False,
-                        )
-                        post_write_lag = datetime.utcnow() - bar_end_time
-                        print(
-                            f"{symbol} {bar_end_time} "
-                            f"(pre-write lag): {pre_write_lag}, "
-                            f"(post-write lag): {post_write_lag}"
-                        )
-
-                # shift bar end time to the right by 1 interval
-                bar_end_time = set_bar_end_time(self._interval, time_stamp)
-
-    def get_price_history_file_path(self, symbol: str):
-        """"""
-        full_path = f"{symbol}.csv"
-        if len(self._history_path) > 0:
-            full_path = f"{self._history_path}\\{full_path}"
-        return full_path
-
-
-
-    def _init_stream_parsers(self, *args: t.Tuple[str, t.Any, t.Dict]):
+    def _init_stream_parsers(self, symbols, stream_start_time):
         """
         initialize stream parser for all symbols in stream, 
         where additional delay relates to time delay of price history data to account for,
@@ -567,31 +428,31 @@ class AbstractTickerStream:
         self._stream_parsers = {
             symbol: (
                 self._stream_parser_cls(
-                    symbol,
-                    data_delay=delay,
+                    symbol=symbol,
+                    time_stamp=stream_start_time,
                     interval=self._interval,
-                    fetch_price_data=self._fetch_price_data,
-                    history_path=self._history_path,
-                    fetch_price_params=fetch_params
                 )
             )
-            for symbol, delay, fetch_params in args
+            for symbol in symbols
         }
-
-
-def price_history_fp(history_path, symbol):
-    full_path = f"{symbol}.csv"
-    if len(history_path) > 0:
-        full_path = f"{history_path}\\{full_path}"
-    return full_path
+        
+    def get_all_symbol_data(self, symbols, interval) -> pd.DataFrame:
+        """get all price history and return concat dataframe of all data"""
+        all_data = []
+        for symbol in symbols:
+            data = self._fetch_price_data(symbol, interval)
+            data['symbol'] = symbol
+            all_data.append(data)
+        return pd.concat(all_data)
 
 
 def _write_row_handler(
         interval,
         columns,
-        get_price_history_file_path,
         history_path,
-        receive_conn: Connection):
+        receive_conn: Connection,
+        send_conn: Connection
+):
     """
     NOTE: Pure function for compatability with multiprocess
     wait until until the current bar time is exceeded, then write
@@ -614,24 +475,22 @@ def _write_row_handler(
                 # don't do anything until we receive the first message
                 continue
 
-            for symbol, price_data in current_quotes.items():
-                if price_data is not None:
-                    new_row = pd.DataFrame(
-                        [price_data.values()],
-                        columns=columns,
-                        index=[bar_end_time],
-                    )
-                    new_row.to_csv(
-                        get_price_history_file_path(history_path, symbol),
-                        mode="a",
-                        header=False,
-                    )
-                    post_write_lag = datetime.utcnow() - bar_end_time
-                    print(
-                        f"{symbol} {bar_end_time} "
-                        f"(pre-write lag): {pre_write_lag}, "
-                        f"(post-write lag): {post_write_lag}"
-                    )
+            symbols_written = []
+            if None in current_quotes.values():
+                idx = list(current_quotes.values()).index(None)
+                raise Exception(f'Not receiving data from {list(current_quotes.keys())[idx]}')
+            
+            price_datas = [price_data for price_data in current_quotes.values() if price_data is not None]
+            new_price_data = pd.DataFrame(price_datas, index=[bar_end_time]*len(price_datas))
+            new_price_data.to_csv(history_path, mode='a', header=False)
+            post_write_lag = datetime.utcnow() - bar_end_time
+            print(
+                f"{bar_end_time} "
+                f"(pre-write lag): {pre_write_lag}, "
+                f"(post-write lag): {post_write_lag}"
+            )
+
+            send_conn.send(True)
 
             # shift bar end time to the right by 1 interval
             bar_end_time = set_bar_end_time(interval, time_stamp)
