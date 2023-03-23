@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 import typing as t
 from datetime import datetime, timedelta
 from enum import Enum, auto
+from functools import reduce
 
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
@@ -10,6 +11,7 @@ from multiprocessing.connection import Connection
 import pandas as pd
 import multiprocessing as mp
 import numpy as np
+
 
 # ----------------------
 # UTIL FUNCTIONS (START)
@@ -57,7 +59,7 @@ def set_bar_end_time(interval, time_stamp):
 def get_target_fetch_time(stream_init_time, interval, data_delay=None):
     """
     given stream start time and interval of data,
-    get the time when price history should be retreived 
+    get the time when price history should be retreived
     to ensure no data gaps
     """
     time_remainder = timedelta(minutes=stream_init_time.minute % interval)
@@ -97,7 +99,7 @@ class AbstractPosition(ABC):
     _stop_value = float
 
     def __init__(
-        self, symbol, qty, side, raw_position=None, stop_value=None, data_row=None
+            self, symbol, qty, side, raw_position=None, stop_value=None, data_row=None
     ):
         self._symbol = symbol
         self._qty = qty
@@ -165,6 +167,7 @@ class AbstractPosition(ABC):
 
 class AbstractBrokerAccount(ABC):
     """get account info"""
+
     def __init__(self, *args, **kwargs):
         pass
 
@@ -183,8 +186,8 @@ class AbstractBrokerAccount(ABC):
     def get_symbols(self) -> t.List[str]:
         """get all symbols of active positions within this account"""
         raise NotImplementedError
-    
-    
+
+
 class ClientAlreadyExistsError(Exception):
     """
     a broker client of this type has already been initialized,
@@ -193,53 +196,106 @@ class ClientAlreadyExistsError(Exception):
 
 
 class AbstractBrokerClient(ABC):
-    __instance_exists = False
     """top level api client"""
+    __instance_exists = False
+
     def __init__(self, credentials, *args, **kwargs):
         if self.__class__.__instance_exists is True:
             raise ClientAlreadyExistsError
         else:
             self.__class__.__instance_exists = True
-            
+
         self._client = self.__class__._get_broker_client(credentials)
 
     @staticmethod
     @abstractmethod
     def _get_broker_client(credentials) -> t.Any:
+        """
+        Initializes the wrapped broker client object and returns object.
+        AbstractBrokerClient uses this method to set its self._client
+        attribute
+        :param credentials: api access credentials for initializing the broker client
+        :return: the broker client object
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def account_info(self, *args, **kwargs) -> t.Type[AbstractBrokerAccount]:
+    def account_info(self, *args, **kwargs):
+        """
+        Get account info of the broker this interface is wrapping
+        :param args:
+        :param kwargs:
+        :return:
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def price_history(self, symbol, freq_range):
+    def price_history(self, symbol, interval, interval_type, **kwargs) -> pd.DataFrame:
+        """
+        Get price history for a single symbol by the given date range and frequency
+        :param symbol: equity symbol to get price history for
+        :param freq_range: time range and interval of the price data to retrieve
+        :return:
+        """
         raise NotImplementedError
 
     @abstractmethod
     def place_order_spec(self, order_spec):
+        """
+        Sends an order object to the broker to be executed
+        :param order_spec: contains specification details of the order
+        :return:
+        """
         raise NotImplementedError
 
     @abstractmethod
     def get_order_data(self, order_id, *args):
+        """
+        Retrieve the details of an order by the given order_id
+        :param order_id:
+        :param args:
+        :return:
+        """
         raise NotImplementedError
 
     @abstractmethod
     def init_position(self, symbol, quantity, side):
         raise NotImplementedError
-    
+
     @abstractmethod
     def init_stream(self, *args, **kwargs):
         raise NotImplementedError
-    
+
     @property
     def client(self):
         return self._client
 
+    def download_price_history(self, symbols: t.List[str], interval, interval_type, **kwargs) -> pd.DataFrame:
+        """
+        Get price data for multiple signals.
+        :param symbols:
+        :param interval:
+        :param interval_type:
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        dfs = []
+        for i, symbol in enumerate(symbols):
+            print(symbol)
+            price_data = self.price_history(
+                symbol=symbol, interval=interval, interval_type=interval_type, **kwargs
+            )
+            price_data.columns = pd.MultiIndex.from_product([[symbol], price_data.columns])
+            dfs.append(price_data)
+
+        dfs_merged = reduce(lambda left, right: left.join(right, how='outer'), dfs)
+        return dfs_merged
+
 
 class AbstractOrders(ABC):
     @abstractmethod
-    def _long_open(self,):
+    def _long_open(self, ):
         pass
 
     @abstractmethod
@@ -338,20 +394,20 @@ class AbstractTickerStream:
     _price_data: t.Union[pd.DataFrame]
 
     def __init__(
-        self,
-        stream_parser: t.Type[AbstractStreamParser],
-        quote_file_path: str,
-        history_path: str,
-        fetch_price_data: DATA_FETCH_FUNCTION,
-        interval: int = 1,
+            self,
+            stream_parser: t.Type[AbstractStreamParser],
+            quote_file_path: str,
+            history_path: str,
+            fetch_price_data: DATA_FETCH_FUNCTION,
+            interval: int = 1,
     ):
         """
         NOTE: fetch_price_data CANNOT be pickled if it is an instance attribute
-        :param stream_parser: 
+        :param stream_parser:
         :param quote_file_path: path to live quote file, SHOULD NOT INCLUDE FILE NAME
         :param history_path: path to output history file, SHOULD NOT INCLUDE FILE NAME
-        :param fetch_price_data: 
-        :param interval: 
+        :param fetch_price_data:
+        :param interval:
         """
         # self.__class__._validate_path(
         #     (quote_file_path, '.json'),
@@ -377,7 +433,7 @@ class AbstractTickerStream:
 
     def get_fetch_time(self, stream_start_time, data_delay):
         return get_target_fetch_time(stream_start_time, self._interval, data_delay)
-        
+
     @staticmethod
     @abstractmethod
     def get_symbol(msg) -> str:
@@ -419,11 +475,11 @@ class AbstractTickerStream:
 
     def _init_stream_parsers(self, symbols, stream_start_time):
         """
-        initialize stream parser for all symbols in stream, 
+        initialize stream parser for all symbols in stream,
         where additional delay relates to time delay of price history data to account for,
         and a dict of params to be passed into the fetch price history function
-        :param args: 
-        :return: 
+        :param args:
+        :return:
         """
         self._stream_parsers = {
             symbol: (
@@ -435,7 +491,7 @@ class AbstractTickerStream:
             )
             for symbol in symbols
         }
-        
+
     def get_all_symbol_data(self, symbols, interval) -> pd.DataFrame:
         """get all price history and return concat dataframe of all data"""
         all_data = []
@@ -479,9 +535,9 @@ def _write_row_handler(
             if None in current_quotes.values():
                 idx = list(current_quotes.values()).index(None)
                 raise Exception(f'Not receiving data from {list(current_quotes.keys())[idx]}')
-            
+
             price_datas = [price_data for price_data in current_quotes.values() if price_data is not None]
-            new_price_data = pd.DataFrame(price_datas, index=[bar_end_time]*len(price_datas))
+            new_price_data = pd.DataFrame(price_datas, index=[bar_end_time] * len(price_datas))
             new_price_data.to_csv(history_path, mode='a', header=False)
             post_write_lag = datetime.utcnow() - bar_end_time
             print(
